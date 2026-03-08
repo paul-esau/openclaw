@@ -143,6 +143,87 @@ export function cleanupStaleChromeSingletonArtifacts(
   return { removed: true, reason, owner: ownerRaw };
 }
 
+type ChromeSingletonCleanupResult = ReturnType<typeof cleanupStaleChromeSingletonArtifacts>;
+
+type BootstrapChromeProcess = Pick<
+  ChildProcessWithoutNullStreams,
+  "exitCode" | "kill" | "signalCode"
+>;
+
+function logStaleChromeSingletonCleanup(
+  profileName: string,
+  lockCleanup: ChromeSingletonCleanupResult,
+) {
+  if (!lockCleanup.removed) {
+    return;
+  }
+  const reason = lockCleanup.reason ?? "stale singleton owner";
+  const ownerDetail = lockCleanup.owner ? ` owner=${lockCleanup.owner}` : "";
+  log.info(
+    `removed stale Chromium singleton artifacts for profile "${profileName}" (${reason}${ownerDetail})`,
+  );
+}
+
+function hasChromeProcessExited(proc: BootstrapChromeProcess) {
+  return proc.exitCode != null || proc.signalCode != null;
+}
+
+async function waitForChromeProcessExit(
+  proc: BootstrapChromeProcess,
+  timeoutMs: number,
+  pollMs = 50,
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (hasChromeProcessExited(proc)) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+  return hasChromeProcessExited(proc);
+}
+
+async function shutdownBootstrapChromeForLaunch(
+  bootstrap: BootstrapChromeProcess,
+  params: {
+    userDataDir: string;
+    profileName: string;
+    cleanupSingletonArtifacts?: typeof cleanupStaleChromeSingletonArtifacts;
+    exitTimeoutMs?: number;
+    pollMs?: number;
+  },
+) {
+  try {
+    bootstrap.kill("SIGTERM");
+  } catch {
+    // ignore
+  }
+
+  const exitTimeoutMs = params.exitTimeoutMs ?? CHROME_BOOTSTRAP_EXIT_TIMEOUT_MS;
+  const pollMs = params.pollMs ?? 50;
+  let exited = await waitForChromeProcessExit(bootstrap, exitTimeoutMs, pollMs);
+  if (!exited) {
+    try {
+      bootstrap.kill("SIGKILL");
+    } catch {
+      // ignore
+    }
+    exited = await waitForChromeProcessExit(bootstrap, exitTimeoutMs, pollMs);
+    if (!exited) {
+      log.warn(`bootstrap Chromium for profile "${params.profileName}" did not exit after SIGKILL`);
+    }
+  }
+
+  // Bootstrap can leave fresh singleton artifacts behind when it exits via signal.
+  const cleanupSingletonArtifacts =
+    params.cleanupSingletonArtifacts ?? cleanupStaleChromeSingletonArtifacts;
+  logStaleChromeSingletonCleanup(params.profileName, cleanupSingletonArtifacts(params.userDataDir));
+}
+
+export const __testing = {
+  shutdownBootstrapChromeForLaunch,
+};
+
 export type RunningChrome = {
   pid: number;
   exe: BrowserExecutable;
@@ -316,13 +397,7 @@ export async function launchOpenClawChrome(
 
   const userDataDir = resolveOpenClawUserDataDir(profile.name);
   fs.mkdirSync(userDataDir, { recursive: true });
-  const lockCleanup = cleanupStaleChromeSingletonArtifacts(userDataDir);
-  if (lockCleanup.removed) {
-    const ownerDetail = lockCleanup.owner ? ` owner=${lockCleanup.owner}` : "";
-    log.info(
-      `removed stale Chromium singleton artifacts for profile "${profile.name}" (${lockCleanup.reason}${ownerDetail})`,
-    );
-  }
+  logStaleChromeSingletonCleanup(profile.name, cleanupStaleChromeSingletonArtifacts(userDataDir));
 
   const needsDecorate = !isProfileDecorated(
     userDataDir,
@@ -397,18 +472,10 @@ export async function launchOpenClawChrome(
       }
       await new Promise((r) => setTimeout(r, 100));
     }
-    try {
-      bootstrap.kill("SIGTERM");
-    } catch {
-      // ignore
-    }
-    const exitDeadline = Date.now() + CHROME_BOOTSTRAP_EXIT_TIMEOUT_MS;
-    while (Date.now() < exitDeadline) {
-      if (bootstrap.exitCode != null) {
-        break;
-      }
-      await new Promise((r) => setTimeout(r, 50));
-    }
+    await shutdownBootstrapChromeForLaunch(bootstrap, {
+      userDataDir,
+      profileName: profile.name,
+    });
   }
 
   if (needsDecorate) {

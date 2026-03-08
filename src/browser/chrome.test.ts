@@ -7,6 +7,7 @@ import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { WebSocketServer } from "ws";
 import {
+  __testing,
   cleanupStaleChromeSingletonArtifacts,
   decorateOpenClawProfile,
   ensureProfileCleanExit,
@@ -23,6 +24,7 @@ import {
 } from "./constants.js";
 
 type StopChromeTarget = Parameters<typeof stopOpenClawChrome>[0];
+type BootstrapChromeTarget = Parameters<typeof __testing.shutdownBootstrapChromeForLaunch>[0];
 
 async function readJson(filePath: string): Promise<Record<string, unknown>> {
   const raw = await fsp.readFile(filePath, "utf-8");
@@ -203,6 +205,22 @@ describe("browser chrome profile decoration", () => {
 });
 
 describe("browser chrome helpers", () => {
+  function makeBootstrapChromeProc(
+    onKill?: (signal: NodeJS.Signals, proc: BootstrapChromeTarget) => void,
+  ): BootstrapChromeTarget {
+    const proc: BootstrapChromeTarget = {
+      exitCode: null,
+      signalCode: null,
+      kill: vi.fn((signal?: number | NodeJS.Signals) => {
+        if (typeof signal === "string") {
+          onKill?.(signal, proc);
+        }
+        return true;
+      }),
+    };
+    return proc;
+  }
+
   function mockExistsSync(match: (pathValue: string) => boolean) {
     return vi.spyOn(fs, "existsSync").mockImplementation((p) => match(String(p)));
   }
@@ -300,6 +318,58 @@ describe("browser chrome helpers", () => {
     } finally {
       await fsp.rm(userDataDir, { recursive: true, force: true });
     }
+  });
+
+  it("cleans singleton artifacts again after bootstrap exits via SIGTERM", async () => {
+    const steps: string[] = [];
+    const proc = makeBootstrapChromeProc((signal, currentProc) => {
+      steps.push(signal);
+      if (signal === "SIGTERM") {
+        currentProc.signalCode = "SIGTERM";
+      }
+    });
+    const cleanup = vi.fn((userDataDir: string) => {
+      steps.push("cleanup");
+      return {
+        removed: true,
+        reason: "owner pid is not running (4242)",
+        owner: userDataDir,
+      };
+    });
+
+    await __testing.shutdownBootstrapChromeForLaunch(proc, {
+      userDataDir: "/tmp/bootstrap-profile",
+      profileName: "default",
+      cleanupSingletonArtifacts: cleanup,
+      exitTimeoutMs: 0,
+    });
+
+    expect(steps).toEqual(["SIGTERM", "cleanup"]);
+    expect(cleanup).toHaveBeenCalledWith("/tmp/bootstrap-profile");
+  });
+
+  it("force-kills bootstrap before second singleton cleanup when SIGTERM times out", async () => {
+    const steps: string[] = [];
+    const proc = makeBootstrapChromeProc((signal, currentProc) => {
+      steps.push(signal);
+      if (signal === "SIGKILL") {
+        currentProc.signalCode = "SIGKILL";
+      }
+    });
+    const cleanup = vi.fn((_userDataDir: string) => {
+      steps.push("cleanup");
+      return { removed: false };
+    });
+
+    await __testing.shutdownBootstrapChromeForLaunch(proc, {
+      userDataDir: "/tmp/bootstrap-profile",
+      profileName: "default",
+      cleanupSingletonArtifacts: cleanup,
+      exitTimeoutMs: 0,
+    });
+
+    expect(steps).toEqual(["SIGTERM", "SIGKILL", "cleanup"]);
+    expect(cleanup).toHaveBeenCalledWith("/tmp/bootstrap-profile");
   });
 
   it("picks the first existing Chrome candidate on macOS", () => {
