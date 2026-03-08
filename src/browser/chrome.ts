@@ -57,6 +57,92 @@ function exists(filePath: string) {
   }
 }
 
+const CHROME_SINGLETON_ARTIFACTS = ["SingletonLock", "SingletonCookie", "SingletonSocket"] as const;
+
+type SingletonLockOwner = {
+  host: string;
+  pid: number;
+};
+
+function parseSingletonLockOwner(raw: string): SingletonLockOwner | null {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const sep = trimmed.lastIndexOf("-");
+  if (sep <= 0 || sep === trimmed.length - 1) {
+    return null;
+  }
+  const host = trimmed.slice(0, sep).trim();
+  const pidRaw = trimmed.slice(sep + 1).trim();
+  if (!host || !/^\d+$/.test(pidRaw)) {
+    return null;
+  }
+  const pid = Number.parseInt(pidRaw, 10);
+  if (!Number.isFinite(pid) || pid <= 0) {
+    return null;
+  }
+  return { host, pid };
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    // EPERM means the process exists but we are not allowed to signal it.
+    return code === "EPERM";
+  }
+}
+
+export function cleanupStaleChromeSingletonArtifacts(
+  userDataDir: string,
+  deps?: {
+    hostname?: string;
+    isProcessAlive?: (pid: number) => boolean;
+  },
+): { removed: boolean; reason?: string; owner?: string } {
+  const lockPath = path.join(userDataDir, "SingletonLock");
+
+  let ownerRaw = "";
+  try {
+    const stat = fs.lstatSync(lockPath);
+    ownerRaw = stat.isSymbolicLink()
+      ? fs.readlinkSync(lockPath).trim()
+      : fs.readFileSync(lockPath, "utf-8").trim();
+  } catch {
+    return { removed: false };
+  }
+
+  const owner = parseSingletonLockOwner(ownerRaw);
+  if (!owner) {
+    return { removed: false, owner: ownerRaw || undefined };
+  }
+
+  const hostname = deps?.hostname ?? os.hostname();
+  const processAlive = deps?.isProcessAlive ?? isProcessAlive;
+  let reason: string | undefined;
+  if (owner.host !== hostname) {
+    reason = `owner host mismatch (${owner.host} != ${hostname})`;
+  } else if (!processAlive(owner.pid)) {
+    reason = `owner pid is not running (${owner.pid})`;
+  }
+
+  if (!reason) {
+    return { removed: false, owner: ownerRaw };
+  }
+
+  for (const artifact of CHROME_SINGLETON_ARTIFACTS) {
+    try {
+      fs.rmSync(path.join(userDataDir, artifact), { force: true });
+    } catch {
+      // ignore best-effort cleanup failures
+    }
+  }
+  return { removed: true, reason, owner: ownerRaw };
+}
+
 export type RunningChrome = {
   pid: number;
   exe: BrowserExecutable;
@@ -230,6 +316,13 @@ export async function launchOpenClawChrome(
 
   const userDataDir = resolveOpenClawUserDataDir(profile.name);
   fs.mkdirSync(userDataDir, { recursive: true });
+  const lockCleanup = cleanupStaleChromeSingletonArtifacts(userDataDir);
+  if (lockCleanup.removed) {
+    const ownerDetail = lockCleanup.owner ? ` owner=${lockCleanup.owner}` : "";
+    log.info(
+      `removed stale Chromium singleton artifacts for profile "${profile.name}" (${lockCleanup.reason}${ownerDetail})`,
+    );
+  }
 
   const needsDecorate = !isProfileDecorated(
     userDataDir,
@@ -265,6 +358,9 @@ export async function launchOpenClawChrome(
     if (process.platform === "linux") {
       args.push("--disable-dev-shm-usage");
     }
+
+    // Stealth: hide navigator.webdriver from automation detection (#80)
+    args.push("--disable-blink-features=AutomationControlled");
 
     // Append user-configured extra arguments (e.g., stealth flags, window size)
     if (resolved.extraArgs.length > 0) {
